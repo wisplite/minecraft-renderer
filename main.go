@@ -1,28 +1,20 @@
 package main
 
 import (
-	"bytes"
-	"compress/gzip"
 	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"image/png"
-	"io"
 	"log"
 	"math/bits"
 	"os"
 	"runtime"
 	"slices"
 	"strings"
-	"sync"
 	"sync/atomic"
 
-	"github.com/klauspost/compress/zlib"
-
-	"github.com/Tnze/go-mc/nbt"
-	"github.com/Tnze/go-mc/save"
 	"github.com/Tnze/go-mc/save/region"
 )
 
@@ -31,10 +23,6 @@ var (
 	RecentChunksCounter    atomic.Int64
 	CurrentChunksPerSecond atomic.Int64
 )
-
-// zlib.NewReader must read a stream header, so readers are created lazily
-// in decodeSlimChunk instead of via a New func.
-var zlibPool sync.Pool
 
 func getAllRegionFiles(path string) []string {
 	files, err := os.ReadDir(path)
@@ -51,15 +39,15 @@ func getAllRegionFiles(path string) []string {
 	return regionFiles
 }
 
-func getBlockColor(block string) color.Color {
-	blockColor, ok := blockColors[block]
+func getBlockColor(block []byte) color.Color {
+	blockColor, ok := blockColors[string(block)]
 	if !ok {
 		return color.RGBA{R: 255, G: 0, B: 255, A: 255}
 	}
 	return blockColor
 }
 
-func saveChunkImage(blocks []string) image.Image {
+func saveChunkImage(blocks [][]byte) image.Image {
 	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
 	for x := 0; x < 16; x++ {
 		for z := 0; z < 16; z++ {
@@ -71,55 +59,7 @@ func saveChunkImage(blocks []string) image.Image {
 	return img
 }
 
-type SlimChunk struct {
-	Status     string              `nbt:"Status"`
-	Heightmaps map[string][]uint64 `nbt:"Heightmaps"`
-	Sections   []SlimSection       `nbt:"sections"`
-	YPos       int                 `nbt:"yPos"`
-}
-
-func decodeSlimChunk(data []byte, chunk *SlimChunk) error {
-	if len(data) == 0 {
-		return errors.New("empty sector")
-	}
-	var r io.Reader = bytes.NewReader(data[1:])
-	var err error
-	switch data[0] {
-	case 1:
-		r, err = gzip.NewReader(r)
-	case 2:
-		var zr io.ReadCloser
-		if v := zlibPool.Get(); v != nil {
-			zr = v.(io.ReadCloser)
-			if err := zr.(zlib.Resetter).Reset(r, nil); err != nil {
-				zlibPool.Put(zr)
-				return err
-			}
-		} else {
-			zr, err = zlib.NewReader(r)
-			if err != nil {
-				return err
-			}
-		}
-		defer zlibPool.Put(zr)
-		r = zr
-	case 3:
-	default:
-		return fmt.Errorf("unknown compression type %d", data[0])
-	}
-	if err != nil {
-		return err
-	}
-	_, err = nbt.NewDecoder(r).Decode(chunk)
-	return err
-}
-
-type SlimSection struct {
-	Y           int                                    `nbt:"Y"`
-	BlockStates save.PaletteContainer[save.BlockState] `nbt:"block_states"`
-}
-
-func processChunk(r *region.Region, cx int, cz int) (image.Image, error) {
+func processChunk(dec *chunkDecoder, r *region.Region, cx int, cz int) (image.Image, error) {
 	if !r.ExistSector(cx, cz) {
 		return nil, errors.New("sector does not exist")
 	}
@@ -128,20 +68,19 @@ func processChunk(r *region.Region, cx int, cz int) (image.Image, error) {
 		log.Printf("Error reading sector: %v", err)
 		return nil, err
 	}
-	var chunk SlimChunk
-	if err := decodeSlimChunk(sector, &chunk); err != nil {
+	chunk, err := dec.decode(sector)
+	if err != nil {
 		log.Printf("Error decoding chunk: %v", err)
 		return nil, err
 	}
-	motionBlocking, ok := chunk.Heightmaps["MOTION_BLOCKING"]
-	if !ok || len(motionBlocking) == 0 {
+	if chunk.MotionBlocking.Len() == 0 {
 		log.Printf("Motion blocking heightmap not found")
 		return nil, errors.New("motion blocking heightmap not found")
 	}
-	heights := unpackHeightmap(motionBlocking)
+	heights := unpackHeightmap(chunk.MotionBlocking)
 	// Heightmap entries are stored as (worldY - minY + 1). 0 means no block.
-	minY := int(chunk.YPos) * 16
-	blocks := make([]string, 16*16)
+	minY := chunk.YPos * 16
+	var blocks [16 * 16][]byte
 	for x := 0; x < 16; x++ {
 		for z := 0; z < 16; z++ {
 			stored := heights[x][z]
@@ -150,36 +89,38 @@ func processChunk(r *region.Region, cx int, cz int) (image.Image, error) {
 			}
 			y := stored - 1 + minY
 			sectionHeight := yToSection(y)
-			for _, section := range chunk.Sections {
-				if int(section.Y) == sectionHeight {
-					block, err := getBlockFromSection(&section, x, y, z)
+			for i := range chunk.Sections {
+				section := &chunk.Sections[i]
+				if section.Y == sectionHeight {
+					block, err := getBlockFromSection(section, x, y, z)
 					if err != nil {
 						log.Printf("Error getting block from section: %v", err)
 						continue
 					}
-					blocks[x*16+z] = block.Name
+					blocks[x*16+z] = block
 				}
 			}
 		}
 	}
-	img := saveChunkImage(blocks)
+	img := saveChunkImage(blocks[:])
 	return img, nil
 }
 
-func getBlockFromSection(section *SlimSection, x int, y int, z int) (save.BlockState, error) {
+// getBlockFromSection returns the name of the block at the given position.
+func getBlockFromSection(section *chunkSection, x int, y int, z int) ([]byte, error) {
 	if section == nil {
-		return save.BlockState{}, errors.New("section is nil")
+		return nil, errors.New("section is nil")
 	}
-	palette := section.BlockStates.Palette
+	palette := section.Palette
 	if len(palette) == 0 {
-		return save.BlockState{}, errors.New("section has no block states")
+		return nil, errors.New("section has no block states")
 	}
 	// A single palette entry fills the whole section, and the packed data array is omitted.
 	if len(palette) == 1 {
 		return palette[0], nil
 	}
-	if len(section.BlockStates.Data) == 0 {
-		return save.BlockState{}, errors.New("section block state data is missing")
+	if section.Data.Len() == 0 {
+		return nil, errors.New("section block state data is missing")
 	}
 
 	localX := x & 15
@@ -187,12 +128,12 @@ func getBlockFromSection(section *SlimSection, x int, y int, z int) (save.BlockS
 	localY := y & 15
 	// Section blocks are stored in YZX order.
 	blockIndex := (localY << 8) | (localZ << 4) | localX
-	paletteIndex, err := packedPaletteIndex(section.BlockStates.Data, len(palette), blockIndex)
+	paletteIndex, err := packedPaletteIndex(section.Data, len(palette), blockIndex)
 	if err != nil {
-		return save.BlockState{}, err
+		return nil, err
 	}
 	if paletteIndex < 0 || paletteIndex >= len(palette) {
-		return save.BlockState{}, fmt.Errorf("palette index %d out of range for palette of length %d", paletteIndex, len(palette))
+		return nil, fmt.Errorf("palette index %d out of range for palette of length %d", paletteIndex, len(palette))
 	}
 	return palette[paletteIndex], nil
 }
@@ -219,7 +160,7 @@ func packedLongCount(bitsPerValue, valueCount int) int {
 	return (valueCount + valuesPerLong - 1) / valuesPerLong
 }
 
-func packedPaletteIndex(data []uint64, paletteLen, index int) (int, error) {
+func packedPaletteIndex(data longArray, paletteLen, index int) (int, error) {
 	const blocksPerSection = 16 * 16 * 16
 	if index < 0 || index >= blocksPerSection {
 		return 0, fmt.Errorf("block index %d out of range", index)
@@ -228,21 +169,21 @@ func packedPaletteIndex(data []uint64, paletteLen, index int) (int, error) {
 	if bitsPerValue == 0 {
 		return 0, nil
 	}
-	if len(data) != packedLongCount(bitsPerValue, blocksPerSection) {
-		return 0, fmt.Errorf("packed block data has %d longs, want %d for a %d-entry palette", len(data), packedLongCount(bitsPerValue, blocksPerSection), paletteLen)
+	if data.Len() != packedLongCount(bitsPerValue, blocksPerSection) {
+		return 0, fmt.Errorf("packed block data has %d longs, want %d for a %d-entry palette", data.Len(), packedLongCount(bitsPerValue, blocksPerSection), paletteLen)
 	}
 	valuesPerLong := 64 / bitsPerValue
 	longIndex := index / valuesPerLong
 	offset := (index % valuesPerLong) * bitsPerValue
 	mask := uint64(1<<bitsPerValue) - 1
-	return int((data[longIndex] >> uint(offset)) & mask), nil
+	return int((data.At(longIndex) >> uint(offset)) & mask), nil
 }
 
 // unpackHeightmap unpacks 256 9-bit Y values from a 1.18+ heightmap.
 // Indexing: heights[x][z] corresponds to chunk-relative coordinates (0..15).
-func unpackHeightmap(data []uint64) [16][16]int {
+func unpackHeightmap(data longArray) [16][16]int {
 	var heights [16][16]int
-	if len(data) == 0 {
+	if data.Len() == 0 {
 		return heights
 	}
 
@@ -253,7 +194,8 @@ func unpackHeightmap(data []uint64) [16][16]int {
 	)
 
 	entryIdx := 0
-	for _, word := range data {
+	for w := 0; w < data.Len(); w++ {
+		word := data.At(w)
 		for i := 0; i < perUint64 && entryIdx < 256; i++ {
 			rawY := int((word >> (i * bitsPerVal)) & mask)
 
@@ -316,18 +258,19 @@ func processRegion(regionFile string) (image.Image, error) {
 		return nil, err
 	}
 	defer r.Close()
+	var dec chunkDecoder
 	images := make([]image.Image, 0)
 	for cz := 0; cz < 32; cz++ {
 		for cx := 0; cx < 32; cx++ {
 			if !r.ExistSector(cx, cz) {
-				arrayOfAir := make([]string, 16*16)
+				arrayOfAir := make([][]byte, 16*16)
 				images = append(images, saveChunkImage(arrayOfAir))
 				continue
 			}
-			img, err := processChunk(r, cx, cz)
+			img, err := processChunk(&dec, r, cx, cz)
 			if err != nil {
 				log.Printf("Error processing chunk: %v", err)
-				arrayOfAir := make([]string, 16*16)
+				arrayOfAir := make([][]byte, 16*16)
 				images = append(images, saveChunkImage(arrayOfAir))
 				continue
 			}
