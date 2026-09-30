@@ -40,7 +40,7 @@ func getBlockColor(block string) color.Color {
 	return blockColor
 }
 
-func saveChunkImage(blocks []string, filename string) image.Image {
+func saveChunkImage(blocks []string) image.Image {
 	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
 	for x := 0; x < 16; x++ {
 		for z := 0; z < 16; z++ {
@@ -52,7 +52,7 @@ func saveChunkImage(blocks []string, filename string) image.Image {
 	return img
 }
 
-func processChunk(r *region.Region, cx int, cz int, regionFile string) (image.Image, error) {
+func processChunk(r *region.Region, cx int, cz int) (image.Image, error) {
 	if !r.ExistSector(cx, cz) {
 		return nil, errors.New("sector does not exist")
 	}
@@ -95,7 +95,7 @@ func processChunk(r *region.Region, cx int, cz int, regionFile string) (image.Im
 			}
 		}
 	}
-	img := saveChunkImage(blocks, fmt.Sprintf("images/%s/c_%d_%d.png", regionFile, cx, cz))
+	img := saveChunkImage(blocks)
 	return img, nil
 }
 
@@ -255,7 +255,7 @@ func processRegion(regionFile string) (image.Image, error) {
 			if !r.ExistSector(cx, cz) {
 				continue
 			}
-			img, err := processChunk(r, cx, cz, parseRegionName(regionFile))
+			img, err := processChunk(r, cx, cz)
 			if err != nil {
 				log.Printf("Error processing chunk: %v", err)
 
