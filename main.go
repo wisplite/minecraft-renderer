@@ -20,7 +20,7 @@ import (
 )
 
 // A separate cache prevents pre-tint images from being reused.
-const imageCacheDir = "images/biome-v1"
+const imageCacheDir = "images"
 
 var (
 	TotalChunksProcessed   atomic.Int64
@@ -63,28 +63,29 @@ func saveChunkImage(blocks [][]byte) image.Image {
 	return img
 }
 
-func processChunk(dec *chunkDecoder, r *region.Region, cx int, cz int) (image.Image, error) {
+func processChunk(dec *chunkDecoder, r *region.Region, cx int, cz int) (image.Image, image.Image, error) {
 	if !r.ExistSector(cx, cz) {
-		return nil, errors.New("sector does not exist")
+		return nil, nil, errors.New("sector does not exist")
 	}
 	sector, err := r.ReadSector(cx, cz)
 	if err != nil {
 		log.Printf("Error reading sector: %v", err)
-		return nil, err
+		return nil, nil, err
 	}
 	chunk, err := dec.decode(sector)
 	if err != nil {
 		log.Printf("Error decoding chunk: %v", err)
-		return nil, err
+		return nil, nil, err
 	}
 	if chunk.MotionBlocking.Len() == 0 {
 		log.Printf("Motion blocking heightmap not found")
-		return nil, errors.New("motion blocking heightmap not found")
+		return nil, nil, errors.New("motion blocking heightmap not found")
 	}
 	heights := unpackHeightmap(chunk.MotionBlocking)
 	// Heightmap entries are stored as (worldY - minY + 1). 0 means no block.
 	minY := chunk.YPos * 16
 	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
+	depthImg := image.NewGray16(image.Rect(0, 0, 16, 16))
 	for x := 0; x < 16; x++ {
 		for z := 0; z < 16; z++ {
 			stored := heights[x][z]
@@ -102,12 +103,13 @@ func processChunk(dec *chunkDecoder, r *region.Region, cx int, cz int) (image.Im
 						continue
 					}
 					img.SetRGBA(x, z, tintedBlockColor(block, biomeFromSection(section, x, y, z)))
+					depthImg.SetGray16(x, z, color.Gray16{Y: uint16(y + 32768)})
 					break
 				}
 			}
 		}
 	}
-	return img, nil
+	return img, depthImg, nil
 }
 
 // getBlockFromSection returns the name of the block at the given position.
@@ -245,6 +247,19 @@ func stitchRegionImage(images []image.Image) image.Image {
 	return img
 }
 
+func stitchDepthImage(images []image.Image) image.Image {
+	img := image.NewGray16(image.Rect(0, 0, 16*32, 16*32))
+	for i, chunkImg := range images {
+		if chunkImg == nil || i >= 32*32 {
+			continue
+		}
+		cx := i % 32
+		cz := i / 32
+		draw.Draw(img, image.Rect(cx*16, cz*16, (cx+1)*16, (cz+1)*16), chunkImg, chunkImg.Bounds().Min, draw.Src)
+	}
+	return img
+}
+
 func saveImage(img image.Image, filename string) error {
 	imgFile, err := os.Create(filename)
 	if err != nil {
@@ -256,14 +271,15 @@ func saveImage(img image.Image, filename string) error {
 	return nil
 }
 
-func processRegion(regionFile string) (image.Image, error) {
+func processRegion(regionFile string) (image.Image, image.Image, error) {
 	r, err := region.Open(regionFile)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	defer r.Close()
 	var dec chunkDecoder
 	images := make([]image.Image, 0)
+	depthImages := make([]image.Image, 0)
 	for cz := 0; cz < 32; cz++ {
 		for cx := 0; cx < 32; cx++ {
 			if !r.ExistSector(cx, cz) {
@@ -271,20 +287,23 @@ func processRegion(regionFile string) (image.Image, error) {
 				images = append(images, saveChunkImage(arrayOfAir))
 				continue
 			}
-			img, err := processChunk(&dec, r, cx, cz)
+			img, depthImg, err := processChunk(&dec, r, cx, cz)
 			if err != nil {
 				log.Printf("Error processing chunk: %v", err)
 				arrayOfAir := make([][]byte, 16*16)
 				images = append(images, saveChunkImage(arrayOfAir))
+				depthImages = append(depthImages, saveChunkImage(arrayOfAir))
 				continue
 			}
 			TotalChunksProcessed.Add(1)
 			RecentChunksCounter.Add(1)
 			images = append(images, img)
+			depthImages = append(depthImages, depthImg)
 		}
 	}
 	img := stitchRegionImage(images)
-	return img, nil
+	depthImg := stitchDepthImage(depthImages)
+	return img, depthImg, nil
 }
 
 func getAllImageFiles(path string) []string {
@@ -303,17 +322,19 @@ func getAllImageFiles(path string) []string {
 }
 
 func processAndSaveRegion(path string, regionFile string, parsedRegionName string) error {
-	img, err := processRegion(fmt.Sprintf("%s/%s", path, regionFile))
+	img, depthImg, err := processRegion(fmt.Sprintf("%s/%s", path, regionFile))
 	if err != nil {
 		log.Printf("Error processing region %s: %v", regionFile, err)
 		return err
 	}
 	saveImage(img, fmt.Sprintf("%s/%s.png", imageCacheDir, parsedRegionName))
+	saveImage(depthImg, fmt.Sprintf("%s/depth/%s_depth.png", imageCacheDir, parsedRegionName))
 	return nil
 }
 
 func processAllRegions(path string) error {
 	os.MkdirAll(imageCacheDir, 0755)
+	os.MkdirAll(fmt.Sprintf("%s/depth", imageCacheDir), 0755)
 	regionFiles := getAllRegionFiles(path)
 	imageFiles := getAllImageFiles(imageCacheDir)
 	sem := make(chan struct{}, runtime.NumCPU())

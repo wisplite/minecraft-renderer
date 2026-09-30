@@ -197,7 +197,7 @@ func BenchmarkProcessRegion(b *testing.B) {
 	defer log.SetOutput(os.Stderr)
 	b.ReportAllocs()
 	for b.Loop() {
-		if _, err := processRegion(file); err != nil {
+		if _, _, err := processRegion(file); err != nil {
 			b.Fatal(err)
 		}
 	}

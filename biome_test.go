@@ -134,7 +134,7 @@ func TestRenderBiomeAtSurface(t *testing.T) {
 		t.Fatal(err)
 	}
 	var dec chunkDecoder
-	img, err := processChunk(&dec, r, 0, 0)
+	img, _, err := processChunk(&dec, r, 0, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
