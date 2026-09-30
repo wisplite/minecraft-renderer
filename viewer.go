@@ -60,7 +60,7 @@ func main() {
 		for range ticker.C {
 			rate := RecentChunksCounter.Swap(0)
 			CurrentChunksPerSecond.Store(rate)
-			imageFiles := getAllImageFiles("images")
+			imageFiles := getAllImageFiles(imageCacheDir)
 			for _, file := range imageFiles {
 				tileChannel <- file
 			}
@@ -82,7 +82,7 @@ func main() {
 			if doesTileExist(tiles, rx, rz) {
 				continue
 			}
-			tiles = append(tiles, loadTile(fmt.Sprintf("images/%s", tile), rx, rz))
+			tiles = append(tiles, loadTile(fmt.Sprintf("%s/%s", imageCacheDir, tile), rx, rz))
 		default:
 		}
 		// --- Controls: Pan (Right Mouse Drag) ---
@@ -126,7 +126,7 @@ func main() {
 				rl.White,
 			)
 			// Optional: draw region border
-			rl.DrawRectangleLines(int32(tile.Pos.X), int32(tile.Pos.Y), 512, 512, rl.Fade(rl.White, 0.2))
+			//rl.DrawRectangleLines(int32(tile.Pos.X), int32(tile.Pos.Y), 512, 512, rl.Fade(rl.White, 0.2))
 		}
 
 		rl.EndMode2D()

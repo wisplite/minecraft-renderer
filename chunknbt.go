@@ -43,8 +43,10 @@ func (a longArray) At(i int) uint64 { return binary.BigEndian.Uint64(a[i*8:]) }
 type chunkSection struct {
 	Y int
 	// Palette holds block names only; block state properties are skipped.
-	Palette [][]byte
-	Data    longArray
+	Palette      [][]byte
+	Data         longArray
+	BiomePalette [][]byte
+	BiomeData    longArray
 }
 
 // chunkData holds the fields of a chunk that the renderer needs. Every byte
@@ -131,7 +133,7 @@ func (c *chunkData) addSection() *chunkSection {
 		c.Sections = append(c.Sections, chunkSection{})
 	}
 	s := &c.Sections[len(c.Sections)-1]
-	*s = chunkSection{Palette: s.Palette[:0]}
+	*s = chunkSection{Palette: s.Palette[:0], BiomePalette: s.BiomePalette[:0]}
 	return s
 }
 
@@ -209,6 +211,8 @@ func parseSection(r *nbtReader, s *chunkSection) error {
 		switch {
 		case string(name) == "Y" && isIntTag(tag):
 			s.Y, err = r.int(tag)
+		case string(name) == "biomes" && tag == tagCompound:
+			err = parseBiomes(r, s)
 		case string(name) == "block_states" && tag == tagCompound:
 			err = parseBlockStates(r, s)
 		default:
@@ -458,4 +462,42 @@ func (r *nbtReader) skipList(elem byte, n, depth int) error {
 		}
 	}
 	return nil
+}
+
+// Biomes use a string palette and a packed 4x4x4 grid within each section.
+func parseBiomes(r *nbtReader, s *chunkSection) error {
+	for {
+		tag, name, err := r.field()
+		if err != nil || tag == tagEnd {
+			return err
+		}
+		switch {
+		case string(name) == "palette" && tag == tagList:
+			s.BiomePalette = s.BiomePalette[:0]
+			var elem byte
+			var n int
+			elem, n, err = r.listHeader()
+			if err == nil {
+				if elem != tagString {
+					err = r.skipList(elem, n, 5)
+				} else {
+					for range n {
+						var biome []byte
+						biome, err = r.str()
+						if err != nil {
+							return err
+						}
+						s.BiomePalette = append(s.BiomePalette, biome)
+					}
+				}
+			}
+		case string(name) == "data" && tag == tagLongArray:
+			s.BiomeData, err = r.longArray()
+		default:
+			err = r.skip(tag, 4)
+		}
+		if err != nil {
+			return err
+		}
+	}
 }

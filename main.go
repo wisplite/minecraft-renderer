@@ -13,10 +13,14 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 
 	"github.com/Tnze/go-mc/save/region"
 )
+
+// A separate cache prevents pre-tint images from being reused.
+const imageCacheDir = "images/biome-v1"
 
 var (
 	TotalChunksProcessed   atomic.Int64
@@ -80,7 +84,7 @@ func processChunk(dec *chunkDecoder, r *region.Region, cx int, cz int) (image.Im
 	heights := unpackHeightmap(chunk.MotionBlocking)
 	// Heightmap entries are stored as (worldY - minY + 1). 0 means no block.
 	minY := chunk.YPos * 16
-	var blocks [16 * 16][]byte
+	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
 	for x := 0; x < 16; x++ {
 		for z := 0; z < 16; z++ {
 			stored := heights[x][z]
@@ -97,12 +101,12 @@ func processChunk(dec *chunkDecoder, r *region.Region, cx int, cz int) (image.Im
 						log.Printf("Error getting block from section: %v", err)
 						continue
 					}
-					blocks[x*16+z] = block
+					img.SetRGBA(x, z, tintedBlockColor(block, biomeFromSection(section, x, y, z)))
+					break
 				}
 			}
 		}
 	}
-	img := saveChunkImage(blocks[:])
 	return img, nil
 }
 
@@ -304,18 +308,21 @@ func processAndSaveRegion(path string, regionFile string, parsedRegionName strin
 		log.Printf("Error processing region %s: %v", regionFile, err)
 		return err
 	}
-	saveImage(img, fmt.Sprintf("images/%s.png", parsedRegionName))
+	saveImage(img, fmt.Sprintf("%s/%s.png", imageCacheDir, parsedRegionName))
 	return nil
 }
 
 func processAllRegions(path string) error {
-	os.MkdirAll("images", 0755)
+	os.MkdirAll(imageCacheDir, 0755)
 	regionFiles := getAllRegionFiles(path)
-	imageFiles := getAllImageFiles("images")
+	imageFiles := getAllImageFiles(imageCacheDir)
 	sem := make(chan struct{}, runtime.NumCPU())
+	wg := sync.WaitGroup{}
 	for _, regionFile := range regionFiles {
 		sem <- struct{}{}
+		wg.Add(1)
 		go func(regionFile string) {
+			defer wg.Done()
 			defer func() { <-sem }()
 			parsedRegionName := parseRegionName(regionFile)
 			if slices.Contains(imageFiles, fmt.Sprintf("%s.png", parsedRegionName)) {
@@ -326,5 +333,6 @@ func processAllRegions(path string) error {
 			}
 		}(regionFile)
 	}
+	wg.Wait()
 	return nil
 }

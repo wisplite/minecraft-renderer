@@ -24,6 +24,7 @@ type refChunk struct {
 type refSection struct {
 	Y           int                                    `nbt:"Y"`
 	BlockStates save.PaletteContainer[save.BlockState] `nbt:"block_states"`
+	Biomes      save.PaletteContainer[string]          `nbt:"biomes"`
 }
 
 func inflateSector(t testing.TB, sector []byte) []byte {
@@ -60,6 +61,19 @@ func compareChunk(t *testing.T, want *refChunk, got *chunkData) {
 		gs := got.Sections[i]
 		if gs.Y != ws.Y {
 			t.Fatalf("section %d: Y = %d, want %d", i, gs.Y, ws.Y)
+		}
+		if len(gs.BiomePalette) != len(ws.Biomes.Palette) || gs.BiomeData.Len() != len(ws.Biomes.Data) {
+			t.Fatalf("section %d: biome container dimensions differ", i)
+		}
+		for j, name := range ws.Biomes.Palette {
+			if string(gs.BiomePalette[j]) != name {
+				t.Fatalf("section %d: biome palette[%d] differs", i, j)
+			}
+		}
+		for j, v := range ws.Biomes.Data {
+			if gs.BiomeData.At(j) != v {
+				t.Fatalf("section %d: biome data[%d] differs", i, j)
+			}
 		}
 		if len(gs.Palette) != len(ws.BlockStates.Palette) {
 			t.Fatalf("section %d: palette has %d entries, want %d", i, len(gs.Palette), len(ws.BlockStates.Palette))
@@ -221,7 +235,8 @@ func FuzzParseChunk(f *testing.F) {
 		Properties map[string]string
 	}
 	type seedSection struct {
-		Y           int8 `nbt:"Y"`
+		Biomes      save.PaletteContainer[string] `nbt:"biomes"`
+		Y           int8                          `nbt:"Y"`
 		BlockStates struct {
 			Palette []seedBlock `nbt:"palette"`
 			Data    []int64     `nbt:"data"`
@@ -236,6 +251,7 @@ func FuzzParseChunk(f *testing.F) {
 		Sections:   make([]seedSection, 1),
 		YPos:       -4,
 	}
+	seed.Sections[0].Biomes = save.PaletteContainer[string]{Palette: []string{"minecraft:plains", "minecraft:swamp"}, Data: []uint64{0xaaaaaaaaaaaaaaaa}}
 	seed.Sections[0].BlockStates.Palette = []seedBlock{
 		{Name: "minecraft:stone"},
 		{Name: "minecraft:water", Properties: map[string]string{"level": "0"}},
