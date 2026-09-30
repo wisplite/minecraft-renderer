@@ -58,6 +58,8 @@ func main() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 		for range ticker.C {
+			rate := RecentChunksCounter.Swap(0)
+			CurrentChunksPerSecond.Store(rate)
 			imageFiles := getAllImageFiles("images")
 			for _, file := range imageFiles {
 				tileChannel <- file
@@ -131,7 +133,8 @@ func main() {
 
 		// Overlay stats
 		rl.DrawText(fmt.Sprintf("Zoom: %.2fx | Cam: (%.0f, %.0f)", camera.Zoom, camera.Target.X, camera.Target.Y), 10, 10, 20, rl.RayWhite)
-		rl.DrawFPS(10, 35)
+		rl.DrawText(fmt.Sprintf("Chunks/s: %d | Total chunks: %d", CurrentChunksPerSecond.Load(), TotalChunksProcessed.Load()), 10, 35, 20, rl.RayWhite)
+		rl.DrawFPS(10, 60)
 
 		rl.EndDrawing()
 	}

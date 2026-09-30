@@ -13,9 +13,16 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync/atomic"
 
 	"github.com/Tnze/go-mc/save"
 	"github.com/Tnze/go-mc/save/region"
+)
+
+var (
+	TotalChunksProcessed   atomic.Int64
+	RecentChunksCounter    atomic.Int64
+	CurrentChunksPerSecond atomic.Int64
 )
 
 func getAllRegionFiles(path string) []string {
@@ -265,6 +272,8 @@ func processRegion(regionFile string) (image.Image, error) {
 				images = append(images, saveChunkImage(arrayOfAir))
 				continue
 			}
+			TotalChunksProcessed.Add(1)
+			RecentChunksCounter.Add(1)
 			images = append(images, img)
 		}
 	}
