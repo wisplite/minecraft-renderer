@@ -1,6 +1,8 @@
 package main
 
 import (
+	"crypto/sha1"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"image"
@@ -81,7 +83,16 @@ func processChunk(dec *chunkDecoder, r *region.Region, cx int, cz int) (image.Im
 		log.Printf("Motion blocking heightmap not found")
 		return nil, nil, errors.New("motion blocking heightmap not found")
 	}
-	heights := unpackHeightmap(chunk.MotionBlocking)
+	bitsPerEntry, err := heightmapBits(chunk.MotionBlocking, chunkHeight(chunk))
+	if err != nil {
+		log.Printf("Error unpacking heightmap: %v", err)
+		return nil, nil, err
+	}
+	heights, err := unpackHeightmap(chunk.MotionBlocking, bitsPerEntry)
+	if err != nil {
+		log.Printf("Error unpacking heightmap: %v", err)
+		return nil, nil, err
+	}
 	// Heightmap entries are stored as (worldY - minY + 1). 0 means no block.
 	minY := chunk.YPos * 16
 	img := image.NewRGBA(image.Rect(0, 0, 16, 16))
@@ -185,19 +196,48 @@ func packedPaletteIndex(data longArray, paletteLen, index int) (int, error) {
 	return int((data.At(longIndex) >> uint(offset)) & mask), nil
 }
 
-// unpackHeightmap unpacks 256 9-bit Y values from a 1.18+ heightmap.
+// chunkHeight returns the height in blocks spanned by the chunk's block
+// sections. Light-only sections just outside the world have no palette and are
+// ignored.
+func chunkHeight(c *chunkData) int {
+	top := c.YPos - 1
+	for i := range c.Sections {
+		if s := &c.Sections[i]; len(s.Palette) > 0 && s.Y > top {
+			top = s.Y
+		}
+	}
+	return (top - c.YPos + 1) * 16
+}
+
+// heightmapBits returns the width of each heightmap entry, which Minecraft sets
+// to ceil(log2(worldHeight+1)): 9 bits for vanilla, more for taller modded
+// worlds. The length alone is ambiguous (11 and 12 bits both need 52 longs),
+// and sections may be missing, so minHeight is only a lower bound.
+func heightmapBits(data longArray, minHeight int) (int, error) {
+	for b := max(bits.Len(uint(minHeight)), 1); b <= 32; b++ {
+		if packedLongCount(b, 256) == data.Len() {
+			return b, nil
+		}
+	}
+	return 0, fmt.Errorf("heightmap has %d longs, which fits no entry width for a world at least %d blocks tall", data.Len(), minHeight)
+}
+
+// unpackHeightmap unpacks 256 Y values from a 1.18+ heightmap.
 // Indexing: heights[x][z] corresponds to chunk-relative coordinates (0..15).
-func unpackHeightmap(data longArray) [16][16]int {
+func unpackHeightmap(data longArray, bitsPerVal int) ([16][16]int, error) {
 	var heights [16][16]int
 	if data.Len() == 0 {
-		return heights
+		return heights, nil
+	}
+	if bitsPerVal <= 0 || bitsPerVal > 32 {
+		return heights, fmt.Errorf("invalid heightmap entry width %d", bitsPerVal)
+	}
+	if want := packedLongCount(bitsPerVal, 256); data.Len() != want {
+		return heights, fmt.Errorf("heightmap has %d longs, want %d for %d-bit entries", data.Len(), want, bitsPerVal)
 	}
 
-	const (
-		bitsPerVal = 9
-		mask       = (1 << bitsPerVal) - 1 // 0x1FF (511)
-		perUint64  = 64 / bitsPerVal       // 7 values per word
-	)
+	mask := uint64(1)<<bitsPerVal - 1
+	perUint64 := 64 / bitsPerVal
 
 	entryIdx := 0
 	for w := 0; w < data.Len(); w++ {
@@ -215,7 +255,7 @@ func unpackHeightmap(data longArray) [16][16]int {
 		}
 	}
 
-	return heights
+	return heights, nil
 }
 
 // yToSection converts a world Y coordinate into a chunk section index.
@@ -328,42 +368,60 @@ func getAllImageFiles(path string) []string {
 	return imageFiles
 }
 
-func processAndSaveRegion(path string, regionFile string, parsedRegionName string) error {
-	img, depthImg, err := processRegion(fmt.Sprintf("%s/%s", path, regionFile))
+// regionCacheDir gives each region folder its own cache, since tile names like
+// r.0.0 repeat across worlds and dimensions.
+func regionCacheDir(regionPath string) string {
+	abs, err := filepath.Abs(regionPath)
+	if err != nil {
+		abs = regionPath
+	}
+	sum := sha1.Sum([]byte(abs))
+	name := filepath.Base(filepath.Dir(abs)) + "-" + hex.EncodeToString(sum[:4])
+	return filepath.Join(imageCacheDir, name)
+}
+
+func processAndSaveRegion(path, cacheDir, regionFile, parsedRegionName string) error {
+	img, depthImg, err := processRegion(filepath.Join(path, regionFile))
 	if err != nil {
 		log.Printf("Error processing region %s: %v", regionFile, err)
 		return err
 	}
-	if err := saveImage(depthImg, fmt.Sprintf("%s/depth/%s_depth.png", imageCacheDir, parsedRegionName)); err != nil {
+	if err := saveImage(depthImg, filepath.Join(cacheDir, "depth", parsedRegionName+"_depth.png")); err != nil {
 		return err
 	}
-	return saveImage(img, fmt.Sprintf("%s/%s.png", imageCacheDir, parsedRegionName))
+	return saveImage(img, filepath.Join(cacheDir, parsedRegionName+".png"))
 }
 
-func processAllRegions(path string) error {
-	if err := os.MkdirAll(filepath.Join(imageCacheDir, "depth"), 0755); err != nil {
+// processAllRegions renders every region in path into cacheDir. Closing stop
+// prevents further regions from starting; regions already in progress finish.
+func processAllRegions(path, cacheDir string, stop <-chan struct{}) error {
+	if err := os.MkdirAll(filepath.Join(cacheDir, "depth"), 0755); err != nil {
 		return err
 	}
 	regionFiles := getAllRegionFiles(path)
 	sem := make(chan struct{}, runtime.NumCPU())
 	wg := sync.WaitGroup{}
+	defer wg.Wait()
 	for _, regionFile := range regionFiles {
-		sem <- struct{}{}
+		select {
+		case sem <- struct{}{}:
+		case <-stop:
+			return nil
+		}
 		wg.Add(1)
 		go func(regionFile string) {
 			defer wg.Done()
 			defer func() { <-sem }()
 			parsedRegionName := parseRegionName(regionFile)
-			_, colorErr := os.Stat(filepath.Join(imageCacheDir, parsedRegionName+".png"))
-			_, depthErr := os.Stat(filepath.Join(imageCacheDir, "depth", parsedRegionName+"_depth.png"))
+			_, colorErr := os.Stat(filepath.Join(cacheDir, parsedRegionName+".png"))
+			_, depthErr := os.Stat(filepath.Join(cacheDir, "depth", parsedRegionName+"_depth.png"))
 			if colorErr == nil && depthErr == nil {
 				return
 			}
-			if err := processAndSaveRegion(path, regionFile, parsedRegionName); err != nil {
+			if err := processAndSaveRegion(path, cacheDir, regionFile, parsedRegionName); err != nil {
 				log.Printf("Error processing region %s: %v", regionFile, err)
 			}
 		}(regionFile)
 	}
-	wg.Wait()
 	return nil
 }
