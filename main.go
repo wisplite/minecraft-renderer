@@ -10,6 +10,7 @@ import (
 	"log"
 	"math/bits"
 	"os"
+	"runtime"
 	"slices"
 	"strings"
 
@@ -286,21 +287,33 @@ func getAllImageFiles(path string) []string {
 	return imageFiles
 }
 
+func processAndSaveRegion(path string, regionFile string, parsedRegionName string) error {
+	img, err := processRegion(fmt.Sprintf("%s/%s", path, regionFile))
+	if err != nil {
+		log.Printf("Error processing region %s: %v", regionFile, err)
+		return err
+	}
+	saveImage(img, fmt.Sprintf("images/%s.png", parsedRegionName))
+	return nil
+}
+
 func processAllRegions(path string) error {
 	os.MkdirAll("images", 0755)
 	regionFiles := getAllRegionFiles(path)
 	imageFiles := getAllImageFiles("images")
+	sem := make(chan struct{}, runtime.NumCPU())
 	for _, regionFile := range regionFiles {
-		parsedRegionName := parseRegionName(regionFile)
-		if slices.Contains(imageFiles, fmt.Sprintf("%s.png", parsedRegionName)) {
-			continue
-		}
-		img, err := processRegion(fmt.Sprintf("%s/%s", path, regionFile))
-		if err != nil {
-			log.Printf("Error processing region %s: %v", regionFile, err)
-			continue
-		}
-		saveImage(img, fmt.Sprintf("images/%s.png", parsedRegionName))
+		sem <- struct{}{}
+		go func(regionFile string) {
+			defer func() { <-sem }()
+			parsedRegionName := parseRegionName(regionFile)
+			if slices.Contains(imageFiles, fmt.Sprintf("%s.png", parsedRegionName)) {
+				return
+			}
+			if err := processAndSaveRegion(path, regionFile, parsedRegionName); err != nil {
+				log.Printf("Error processing region %s: %v", regionFile, err)
+			}
+		}(regionFile)
 	}
 	return nil
 }
