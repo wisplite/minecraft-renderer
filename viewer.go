@@ -1,8 +1,10 @@
 package main
 
 import (
+	_ "embed"
 	"fmt"
 	"log"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -10,7 +12,11 @@ import (
 	rl "github.com/gen2brain/raylib-go/raylib"
 )
 
+//go:embed shaders/hillshade.fs
+var hillshadeFragment string
+
 type RegionTile struct {
+	Depth   rl.Texture2D
 	Texture rl.Texture2D
 	Pos     rl.Vector2 // World space (rx*512, rz*512)
 }
@@ -26,13 +32,25 @@ func doesTileExist(tiles []RegionTile, rx, rz int) bool {
 
 func main() {
 	rl.InitWindow(1280, 720, "Minecraft World Viewer")
+	if !rl.IsWindowReady() {
+		log.Print("Unable to initialize viewer window")
+		return
+	}
 	defer rl.CloseWindow()
 	rl.SetTargetFPS(60)
+
+	shader := rl.LoadShaderFromMemory("", hillshadeFragment)
+	defer rl.UnloadShader(shader)
+	depthLocation := rl.GetShaderLocation(shader, "depthMap")
+	if depthLocation < 0 {
+		log.Print("Hillshade shader unavailable; displaying color tiles")
+	}
+	hillshading := depthLocation >= 0
 
 	go func() {
 		err := processAllRegions("test/region")
 		if err != nil {
-			log.Fatalf("Error processing regions: %v", err)
+			log.Printf("Error processing regions: %v", err)
 		}
 	}()
 
@@ -48,21 +66,32 @@ func main() {
 	defer func() {
 		for _, t := range tiles {
 			rl.UnloadTexture(t.Texture)
+			rl.UnloadTexture(t.Depth)
 		}
 	}()
 
 	tileChannel := make(chan string)
-	defer close(tileChannel)
+	done := make(chan struct{})
+	defer close(done)
 
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
-		for range ticker.C {
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+			}
 			rate := RecentChunksCounter.Swap(0)
 			CurrentChunksPerSecond.Store(rate)
 			imageFiles := getAllImageFiles(imageCacheDir)
 			for _, file := range imageFiles {
-				tileChannel <- file
+				select {
+				case tileChannel <- file:
+				case <-done:
+					return
+				}
 			}
 		}
 	}()
@@ -71,19 +100,25 @@ func main() {
 		select {
 		case tile := <-tileChannel:
 			coords := strings.Split(tile, ".")
-			rx, err := strconv.Atoi(coords[1])
+			if len(coords) != 4 || coords[0] != "r" || coords[3] != "png" {
+				break
+			}
+			rx, xErr := strconv.Atoi(coords[1])
+			rz, zErr := strconv.Atoi(coords[2])
+			if xErr != nil || zErr != nil || doesTileExist(tiles, rx, rz) {
+				break
+			}
+			loaded, err := loadTile(filepath.Join(imageCacheDir, tile), rx, rz)
 			if err != nil {
-				log.Fatalf("Error parsing rx: %v", err)
+				// A depth map may still be generating; the next scan retries it.
+				log.Printf("Loading %s: %v", tile, err)
+				break
 			}
-			rz, err := strconv.Atoi(coords[2])
-			if err != nil {
-				log.Fatalf("Error parsing rz: %v", err)
-			}
-			if doesTileExist(tiles, rx, rz) {
-				continue
-			}
-			tiles = append(tiles, loadTile(fmt.Sprintf("%s/%s", imageCacheDir, tile), rx, rz))
+			tiles = append(tiles, loaded)
 		default:
+		}
+		if rl.IsKeyPressed(rl.KeyH) && depthLocation >= 0 {
+			hillshading = !hillshading
 		}
 		// --- Controls: Pan (Right Mouse Drag) ---
 		if rl.IsMouseButtonDown(rl.MouseRightButton) {
@@ -119,12 +154,20 @@ func main() {
 
 		// Draw all loaded tiles
 		for _, tile := range tiles {
+			if hillshading {
+				rl.BeginShaderMode(shader)
+				rl.SetShaderValueTexture(shader, depthLocation, tile.Depth)
+			}
 			rl.DrawTextureRec(
 				tile.Texture,
 				rl.NewRectangle(0, 0, float32(tile.Texture.Width), float32(tile.Texture.Height)),
 				tile.Pos,
 				rl.White,
 			)
+			if hillshading {
+				// EndShaderMode flushes this tile before its depth sampler changes.
+				rl.EndShaderMode()
+			}
 			// Optional: draw region border
 			//rl.DrawRectangleLines(int32(tile.Pos.X), int32(tile.Pos.Y), 512, 512, rl.Fade(rl.White, 0.2))
 		}
@@ -135,18 +178,40 @@ func main() {
 		rl.DrawText(fmt.Sprintf("Zoom: %.2fx | Cam: (%.0f, %.0f)", camera.Zoom, camera.Target.X, camera.Target.Y), 10, 10, 20, rl.RayWhite)
 		rl.DrawText(fmt.Sprintf("Chunks/s: %d | Total chunks: %d", CurrentChunksPerSecond.Load(), TotalChunksProcessed.Load()), 10, 35, 20, rl.RayWhite)
 		rl.DrawFPS(10, 60)
+		rl.DrawText(fmt.Sprintf("[H] Hillshading: %t", hillshading), 10, 85, 20, rl.RayWhite)
 
 		rl.EndDrawing()
 	}
 }
 
-func loadTile(path string, rx, rz int) RegionTile {
+func loadTile(path string, rx, rz int) (RegionTile, error) {
+	depthPath := filepath.Join(filepath.Dir(path), "depth", fmt.Sprintf("r.%d.%d_depth.png", rx, rz))
+	packed, err := readDepthMap(depthPath, 512, 512)
+	if err != nil {
+		return RegionTile{}, err
+	}
 	tex := rl.LoadTexture(path)
-	// Point filtering keeps Minecraft pixels crisp when zooming in
+	if tex.ID == 0 {
+		return RegionTile{}, fmt.Errorf("load color texture %s", path)
+	}
+	if tex.Width != 512 || tex.Height != 512 {
+		rl.UnloadTexture(tex)
+		return RegionTile{}, fmt.Errorf("color tile must be 512x512")
+	}
+	depthImage := rl.NewImageFromImage(packed)
+	depth := rl.LoadTextureFromImage(depthImage)
+	rl.UnloadImage(depthImage)
+	if depth.ID == 0 {
+		rl.UnloadTexture(tex)
+		return RegionTile{}, fmt.Errorf("upload depth texture %s", depthPath)
+	}
+	// Point sampling preserves both the block colors and packed height bytes.
 	rl.SetTextureFilter(tex, rl.FilterPoint)
-
+	rl.SetTextureFilter(depth, rl.FilterPoint)
+	rl.SetTextureWrap(depth, rl.WrapClamp)
 	return RegionTile{
 		Texture: tex,
+		Depth:   depth,
 		Pos:     rl.NewVector2(float32(rx*512), float32(rz*512)),
-	}
+	}, nil
 }
