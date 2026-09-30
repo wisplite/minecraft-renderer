@@ -3,11 +3,16 @@ package main
 import (
 	_ "embed"
 	"fmt"
+	"image"
+	"image/draw"
+	"image/png"
 	"log"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	rl "github.com/gen2brain/raylib-go/raylib"
@@ -22,13 +27,27 @@ type RegionTile struct {
 	Pos     rl.Vector2 // World space (rx*512, rz*512)
 }
 
-func doesTileExist(tiles []RegionTile, rx, rz int) bool {
-	for _, tile := range tiles {
-		if tile.Pos.X == float32(rx*512) && tile.Pos.Y == float32(rz*512) {
-			return true
-		}
+const tileSize = 512
+
+// tileUploadBudget caps how long each frame spends uploading textures.
+const tileUploadBudget = 16 * time.Millisecond
+
+// decodedTile holds a tile's pixels, decoded off the render thread and ready
+// for GPU upload.
+type decodedTile struct {
+	rx, rz int
+	color  []byte // Non-premultiplied RGBA
+	depth  *image.RGBA
+}
+
+func parseTileName(name string) (rx, rz int, ok bool) {
+	coords := strings.Split(name, ".")
+	if len(coords) != 4 || coords[0] != "r" || coords[3] != "png" {
+		return 0, 0, false
 	}
-	return false
+	rx, xErr := strconv.Atoi(coords[1])
+	rz, zErr := strconv.Atoi(coords[2])
+	return rx, rz, xErr == nil && zErr == nil
 }
 
 func main() {
@@ -124,25 +143,20 @@ func main() {
 			}()
 		}
 
-		select {
-		case tile := <-session.tiles:
-			coords := strings.Split(tile, ".")
-			if len(coords) != 4 || coords[0] != "r" || coords[3] != "png" {
-				break
+		uploadStart := time.Now()
+	upload:
+		for time.Since(uploadStart) < tileUploadBudget {
+			select {
+			case decoded := <-session.tiles:
+				tile, err := uploadTile(decoded)
+				if err != nil {
+					log.Printf("Uploading r.%d.%d: %v", decoded.rx, decoded.rz, err)
+					continue
+				}
+				tiles = append(tiles, tile)
+			default:
+				break upload
 			}
-			rx, xErr := strconv.Atoi(coords[1])
-			rz, zErr := strconv.Atoi(coords[2])
-			if xErr != nil || zErr != nil || doesTileExist(tiles, rx, rz) {
-				break
-			}
-			loaded, err := loadTile(filepath.Join(session.cacheDir, tile), rx, rz)
-			if err != nil {
-				// A depth map may still be generating; the next scan retries it.
-				log.Printf("Loading %s: %v", tile, err)
-				break
-			}
-			tiles = append(tiles, loaded)
-		default:
 		}
 		if rl.IsKeyPressed(rl.KeyH) && depthLocation >= 0 {
 			hillshading = !hillshading
@@ -163,8 +177,8 @@ func main() {
 			camera.Target = mouseWorldPos
 
 			camera.Zoom += wheel * 0.125 * camera.Zoom
-			if camera.Zoom < 0.05 {
-				camera.Zoom = 0.05
+			if camera.Zoom < 0.01 {
+				camera.Zoom = 0.01
 			} else if camera.Zoom > 16.0 {
 				camera.Zoom = 16.0
 			}
@@ -226,7 +240,7 @@ func main() {
 type worldSession struct {
 	regionDir string
 	cacheDir  string
-	tiles     chan string
+	tiles     chan decodedTile
 	done      chan struct{}
 }
 
@@ -234,7 +248,7 @@ func startWorldSession(regionDir string) *worldSession {
 	s := &worldSession{
 		regionDir: regionDir,
 		cacheDir:  regionCacheDir(regionDir),
-		tiles:     make(chan string),
+		tiles:     make(chan decodedTile, runtime.NumCPU()),
 		done:      make(chan struct{}),
 	}
 	go func() {
@@ -245,18 +259,13 @@ func startWorldSession(regionDir string) *worldSession {
 	go func() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
+		sent := make(map[string]bool)
 		for {
+			s.decodeNewTiles(sent)
 			select {
 			case <-s.done:
 				return
 			case <-ticker.C:
-			}
-			for _, file := range getAllImageFiles(s.cacheDir) {
-				select {
-				case s.tiles <- file:
-				case <-s.done:
-					return
-				}
 			}
 		}
 	}()
@@ -267,27 +276,115 @@ func (s *worldSession) stop() {
 	close(s.done)
 }
 
-func loadTile(path string, rx, rz int) (RegionTile, error) {
-	depthPath := filepath.Join(filepath.Dir(path), "depth", fmt.Sprintf("r.%d.%d_depth.png", rx, rz))
-	packed, err := readDepthMap(depthPath, 512, 512)
+// decodeNewTiles decodes every cached tile not yet in sent, in parallel, and
+// hands them to the viewer. Tiles that fail to decode are retried next scan.
+func (s *worldSession) decodeNewTiles(sent map[string]bool) {
+	type job struct {
+		name   string
+		rx, rz int
+	}
+	var pending []job
+	for _, name := range getAllImageFiles(s.cacheDir) {
+		if sent[name] {
+			continue
+		}
+		if rx, rz, ok := parseTileName(name); ok {
+			pending = append(pending, job{name, rx, rz})
+		}
+	}
+	if len(pending) == 0 {
+		return
+	}
+
+	jobs := make(chan job)
+	var mu sync.Mutex
+	var wg sync.WaitGroup
+	for range min(runtime.NumCPU(), len(pending)) {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := range jobs {
+				tile, err := decodeTile(s.cacheDir, j.rx, j.rz)
+				if err != nil {
+					log.Printf("Loading %s: %v", j.name, err)
+					continue
+				}
+				select {
+				case s.tiles <- tile:
+					mu.Lock()
+					sent[j.name] = true
+					mu.Unlock()
+				case <-s.done:
+					return
+				}
+			}
+		}()
+	}
+feed:
+	for _, j := range pending {
+		select {
+		case jobs <- j:
+		case <-s.done:
+			break feed
+		}
+	}
+	close(jobs)
+	wg.Wait()
+}
+
+func decodeTile(cacheDir string, rx, rz int) (decodedTile, error) {
+	depthPath := filepath.Join(cacheDir, "depth", fmt.Sprintf("r.%d.%d_depth.png", rx, rz))
+	depth, err := readDepthMap(depthPath, tileSize, tileSize)
 	if err != nil {
-		return RegionTile{}, err
+		return decodedTile{}, err
 	}
-	tex := rl.LoadTexture(path)
+	colorPath := filepath.Join(cacheDir, fmt.Sprintf("r.%d.%d.png", rx, rz))
+	f, err := os.Open(colorPath)
+	if err != nil {
+		return decodedTile{}, err
+	}
+	defer f.Close()
+	img, err := png.Decode(f)
+	if err != nil {
+		return decodedTile{}, fmt.Errorf("decode color tile: %w", err)
+	}
+	if img.Bounds().Dx() != tileSize || img.Bounds().Dy() != tileSize {
+		return decodedTile{}, fmt.Errorf("color tile must be %dx%d", tileSize, tileSize)
+	}
+	return decodedTile{rx: rx, rz: rz, color: nrgbaPixels(img), depth: depth}, nil
+}
+
+// nrgbaPixels returns img as tightly packed, non-premultiplied RGBA bytes.
+func nrgbaPixels(img image.Image) []byte {
+	b := img.Bounds()
+	switch m := img.(type) {
+	case *image.NRGBA:
+		if m.Stride == b.Dx()*4 {
+			return m.Pix
+		}
+	case *image.RGBA:
+		if m.Stride == b.Dx()*4 && m.Opaque() {
+			return m.Pix
+		}
+	}
+	dst := image.NewNRGBA(image.Rect(0, 0, b.Dx(), b.Dy()))
+	draw.Draw(dst, dst.Bounds(), img, b.Min, draw.Src)
+	return dst.Pix
+}
+
+// uploadTile creates the GPU textures for a decoded tile. It must run on the
+// render thread.
+func uploadTile(t decodedTile) (RegionTile, error) {
+	tex := rl.LoadTextureFromImage(rl.NewImage(t.color, tileSize, tileSize, 1, rl.UncompressedR8g8b8a8))
 	if tex.ID == 0 {
-		return RegionTile{}, fmt.Errorf("load color texture %s", path)
+		return RegionTile{}, fmt.Errorf("upload color texture")
 	}
-	if tex.Width != 512 || tex.Height != 512 {
-		rl.UnloadTexture(tex)
-		return RegionTile{}, fmt.Errorf("color tile must be 512x512")
-	}
-	depthImage := rl.NewImageFromImage(packed)
-	depth := rl.LoadTextureFromImage(depthImage)
-	rl.UnloadImage(depthImage)
+	depth := rl.LoadTextureFromImage(rl.NewImage(t.depth.Pix, tileSize, tileSize, 1, rl.UncompressedR8g8b8a8))
 	if depth.ID == 0 {
 		rl.UnloadTexture(tex)
-		return RegionTile{}, fmt.Errorf("upload depth texture %s", depthPath)
+		return RegionTile{}, fmt.Errorf("upload depth texture")
 	}
+	rx, rz := t.rx, t.rz
 	// Point sampling preserves both the block colors and packed height bytes.
 	rl.SetTextureFilter(tex, rl.FilterPoint)
 	rl.SetTextureFilter(depth, rl.FilterPoint)
@@ -295,6 +392,6 @@ func loadTile(path string, rx, rz int) (RegionTile, error) {
 	return RegionTile{
 		Texture: tex,
 		Depth:   depth,
-		Pos:     rl.NewVector2(float32(rx*512), float32(rz*512)),
+		Pos:     rl.NewVector2(float32(rx*tileSize), float32(rz*tileSize)),
 	}, nil
 }
