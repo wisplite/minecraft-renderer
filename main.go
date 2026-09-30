@@ -253,12 +253,15 @@ func processRegion(regionFile string) (image.Image, error) {
 	for cz := 0; cz < 32; cz++ {
 		for cx := 0; cx < 32; cx++ {
 			if !r.ExistSector(cx, cz) {
+				arrayOfAir := make([]string, 16*16)
+				images = append(images, saveChunkImage(arrayOfAir))
 				continue
 			}
 			img, err := processChunk(r, cx, cz)
 			if err != nil {
 				log.Printf("Error processing chunk: %v", err)
-
+				arrayOfAir := make([]string, 16*16)
+				images = append(images, saveChunkImage(arrayOfAir))
 				continue
 			}
 			images = append(images, img)
@@ -284,6 +287,7 @@ func getAllImageFiles(path string) []string {
 }
 
 func processAllRegions(path string) error {
+	os.MkdirAll("images", 0755)
 	regionFiles := getAllRegionFiles(path)
 	imageFiles := getAllImageFiles("images")
 	for _, regionFile := range regionFiles {
