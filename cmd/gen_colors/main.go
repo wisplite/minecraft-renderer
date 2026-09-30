@@ -61,13 +61,15 @@ type assets struct {
 	models map[string]map[string]string
 }
 
-func newAssets(zipFile *zip.ReadCloser) *assets {
+func newAssets(zipFiles ...*zip.ReadCloser) *assets {
 	a := &assets{
-		files:  make(map[string]*zip.File, len(zipFile.File)),
+		files:  make(map[string]*zip.File),
 		models: make(map[string]map[string]string),
 	}
-	for _, entry := range zipFile.File {
-		a.files[entry.Name] = entry
+	for _, zipFile := range zipFiles {
+		for _, entry := range zipFile.File {
+			a.files[entry.Name] = entry
+		}
 	}
 	return a
 }
@@ -100,10 +102,10 @@ func (a *assets) blockStateNames() map[string]string {
 	names := make(map[string]string)
 	for name := range a.files {
 		parts := strings.Split(name, "/")
-		if len(parts) != 4 || parts[0] != "assets" || parts[2] != "blockstates" || !strings.HasSuffix(parts[3], ".json") {
+		if len(parts) < 4 || parts[0] != "assets" || parts[2] != "blockstates" || !strings.HasSuffix(name, ".json") {
 			continue
 		}
-		names[parts[1]+":"+strings.TrimSuffix(parts[3], ".json")] = name
+		names[parts[1]+":"+strings.TrimSuffix(strings.Join(parts[3:], "/"), ".json")] = name
 	}
 	return names
 }
@@ -282,15 +284,15 @@ func textureNameLess(a, b string) bool {
 	return an < bn
 }
 
-func averageTexture(file *zip.File) color.RGBA {
+func averageTexture(file *zip.File) (color.RGBA, error) {
 	rc, err := file.Open()
 	if err != nil {
-		log.Fatalf("Failed to open file: %v", err)
+		return color.RGBA{}, err
 	}
 	defer rc.Close()
 	img, err := png.Decode(rc)
 	if err != nil {
-		log.Fatalf("Failed to decode image: %v", err)
+		return color.RGBA{}, err
 	}
 	bounds := img.Bounds()
 	var totalR, totalG, totalB, count uint64
@@ -308,14 +310,14 @@ func averageTexture(file *zip.File) color.RGBA {
 		}
 	}
 	if count == 0 {
-		return color.RGBA{A: 0}
+		return color.RGBA{A: 0}, nil
 	}
 	return color.RGBA{
 		R: uint8((totalR / count) >> 8),
 		G: uint8((totalG / count) >> 8),
 		B: uint8((totalB / count) >> 8),
 		A: uint8(255),
-	}
+	}, nil
 }
 
 func writeGoColorFile(outPath string, colors map[string]color.RGBA) error {
@@ -356,34 +358,51 @@ func appendSpecialColors(colors map[string]color.RGBA) {
 }
 
 func main() {
-	var zipFileName string
-	flag.StringVar(&zipFileName, "i", "", "The input jar file to extract the blocks from")
+	var inputs inputPaths
+	flag.Var(&inputs, "i", "Input JAR or directory of JARs (recursive); repeat to combine inputs, later inputs override earlier assets")
 	var outPath string
 	flag.StringVar(&outPath, "o", "block_colors.go", "The output file to write the colors to")
 	var biomeOut string
 	flag.StringVar(&biomeOut, "biomes", "", "Optional output Go file for biome tints")
 	flag.Parse()
-	if zipFileName == "" {
+	if len(inputs) == 0 {
 		flag.PrintDefaults()
 		os.Exit(1)
 	}
-	zipFile, err := zip.OpenReader(zipFileName)
+	jars, err := openInputs(inputs)
 	if err != nil {
-		log.Fatalf("Failed to open zip file: %v", err)
+		log.Fatal(err)
 	}
-	defer zipFile.Close()
-	a := newAssets(zipFile)
+	defer closeJars(jars)
+	a := newAssets(jars...)
+	log.Printf("Loaded %d JARs", len(jars))
 	if biomeOut != "" {
 		if err := a.writeBiomeColors(biomeOut); err != nil {
 			log.Fatal(err)
 		}
 	}
+	colors := a.blockColors()
+	err = writeGoColorFile(outPath, colors)
+	if err != nil {
+		log.Fatalf("Failed to write go color file: %v", err)
+	}
+}
+
+func (a *assets) blockColors() map[string]color.RGBA {
 	colors := make(map[string]color.RGBA)
 	averages := make(map[string]color.RGBA)
-	for blockID, stateFile := range a.blockStateNames() {
+	states := a.blockStateNames()
+	ids := make([]string, 0, len(states))
+	for id := range states {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	for _, blockID := range ids {
+		stateFile := states[blockID]
 		textures, err := a.blockTextures(stateFile)
 		if err != nil {
-			log.Fatalf("Failed to read blockstate %s: %v", stateFile, err)
+			log.Printf("Skipping blockstate %s: %v", stateFile, err)
+			continue
 		}
 		if len(textures) == 0 {
 			log.Printf("No textures found for %s", blockID)
@@ -393,14 +412,16 @@ func main() {
 		texture := pickBlockTexture(name, textures)
 		avg, ok := averages[texture]
 		if !ok {
-			avg = averageTexture(a.files[texture])
+			avg, err = averageTexture(a.files[texture])
+			if err != nil {
+				log.Printf("Skipping %s: texture %s: %v", blockID, texture, err)
+				continue
+			}
 			averages[texture] = avg
 		}
 		colors[blockID] = avg
 	}
+	log.Printf("Generated colors for %d of %d blockstates (%d skipped)", len(colors), len(states), len(states)-len(colors))
 	appendSpecialColors(colors)
-	err = writeGoColorFile(outPath, colors)
-	if err != nil {
-		log.Fatalf("Failed to write go color file: %v", err)
-	}
+	return colors
 }

@@ -30,7 +30,7 @@ type RegionTile struct {
 const tileSize = 512
 
 // tileUploadBudget caps how long each frame spends uploading textures.
-const tileUploadBudget = 16 * time.Millisecond
+const tileUploadBudget = 32 * time.Millisecond
 
 // decodedTile holds a tile's pixels, decoded off the render thread and ready
 // for GPU upload.
