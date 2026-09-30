@@ -1,20 +1,27 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"image"
 	"image/color"
 	"image/draw"
 	"image/png"
+	"io"
 	"log"
 	"math/bits"
 	"os"
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 
+	"github.com/klauspost/compress/zlib"
+
+	"github.com/Tnze/go-mc/nbt"
 	"github.com/Tnze/go-mc/save"
 	"github.com/Tnze/go-mc/save/region"
 )
@@ -24,6 +31,10 @@ var (
 	RecentChunksCounter    atomic.Int64
 	CurrentChunksPerSecond atomic.Int64
 )
+
+// zlib.NewReader must read a stream header, so readers are created lazily
+// in decodeSlimChunk instead of via a New func.
+var zlibPool sync.Pool
 
 func getAllRegionFiles(path string) []string {
 	files, err := os.ReadDir(path)
@@ -60,6 +71,54 @@ func saveChunkImage(blocks []string) image.Image {
 	return img
 }
 
+type SlimChunk struct {
+	Status     string              `nbt:"Status"`
+	Heightmaps map[string][]uint64 `nbt:"Heightmaps"`
+	Sections   []SlimSection       `nbt:"sections"`
+	YPos       int                 `nbt:"yPos"`
+}
+
+func decodeSlimChunk(data []byte, chunk *SlimChunk) error {
+	if len(data) == 0 {
+		return errors.New("empty sector")
+	}
+	var r io.Reader = bytes.NewReader(data[1:])
+	var err error
+	switch data[0] {
+	case 1:
+		r, err = gzip.NewReader(r)
+	case 2:
+		var zr io.ReadCloser
+		if v := zlibPool.Get(); v != nil {
+			zr = v.(io.ReadCloser)
+			if err := zr.(zlib.Resetter).Reset(r, nil); err != nil {
+				zlibPool.Put(zr)
+				return err
+			}
+		} else {
+			zr, err = zlib.NewReader(r)
+			if err != nil {
+				return err
+			}
+		}
+		defer zlibPool.Put(zr)
+		r = zr
+	case 3:
+	default:
+		return fmt.Errorf("unknown compression type %d", data[0])
+	}
+	if err != nil {
+		return err
+	}
+	_, err = nbt.NewDecoder(r).Decode(chunk)
+	return err
+}
+
+type SlimSection struct {
+	Y           int                                    `nbt:"Y"`
+	BlockStates save.PaletteContainer[save.BlockState] `nbt:"block_states"`
+}
+
 func processChunk(r *region.Region, cx int, cz int) (image.Image, error) {
 	if !r.ExistSector(cx, cz) {
 		return nil, errors.New("sector does not exist")
@@ -69,9 +128,9 @@ func processChunk(r *region.Region, cx int, cz int) (image.Image, error) {
 		log.Printf("Error reading sector: %v", err)
 		return nil, err
 	}
-	var chunk save.Chunk
-	if err := chunk.Load(sector); err != nil {
-		log.Printf("Error loading chunk: %v", err)
+	var chunk SlimChunk
+	if err := decodeSlimChunk(sector, &chunk); err != nil {
+		log.Printf("Error decoding chunk: %v", err)
 		return nil, err
 	}
 	motionBlocking, ok := chunk.Heightmaps["MOTION_BLOCKING"]
@@ -107,7 +166,7 @@ func processChunk(r *region.Region, cx int, cz int) (image.Image, error) {
 	return img, nil
 }
 
-func getBlockFromSection(section *save.Section, x int, y int, z int) (save.BlockState, error) {
+func getBlockFromSection(section *SlimSection, x int, y int, z int) (save.BlockState, error) {
 	if section == nil {
 		return save.BlockState{}, errors.New("section is nil")
 	}
